@@ -1,0 +1,402 @@
+#!/usr/bin/python3
+# plmp3 - mp3 player for gadget2 (raspberry pi zero W)
+# k theis 10/2018
+'''
+This is an mp3 player written in python 3 using a raspberry pi zero w.
+I expect it should work with any computer thay runs python 3 using appropriate
+hardware and software drivers.
+
+The software library used for mp3 codecs etc is vlc.py
+The ID3 data is from the eyeD3 library.
+
+pip3 install python-vlc (for mp3 player)
+vlc (via sudo apt-get install vlc) for mp3 player
+pip install eyeD3 (for mp3 ID3 tags for mp3 player)
+
+Hardware used for the mp3 player include a 2x16 line LCD display
+connected via I2C thru an adafruit i2c-lcd interface board.
+
+The switches are using an adafruit capacitive touch sensor 
+(mpr121, part number 1982) with the sensor pins wired as 
+follows:
+pin 0:	unused
+pin 1:	shift (rcrd - used as a record button in other applications)
+pin 2:	stop
+pin 3:	play/pause
+pin 4:	rewind to beginning of the current playing song
+pin 5:	foward to next song
+pin 6-13: unused
+
+Lastly, there is a rotary encoder (mechanical, 2 lines) tied to
+GPIO. This is used for a volume control, tuning in 5% steps.
+
+shift function commands:
+rcrd + stop:	save current song to most fav playlist (mostfav.m3u)
+rcrd + play:	toggle thru shuffle and repeat play
+rcrd + rew:	shuffle back by 2%/second to beginning of song
+rcrd + fwd:	shuffle forward by 2%/second to end of song
+
+The output goes thru I2S for audio out giving CD quality. The board
+I use is an adafruit I2S stereo decoder, UDA1334A. With the wires 
+between the pi zero and the I2S board kept apart from other wires, the
+playback audio is very nice. No clicks, 44.1k audio quality. Much better 
+(and easier to setup/use) than an external USB soundcard.
+
+Many of the hardware drivers come from adafruit's circuit py driver library.
+Their instructions for install and setup are adequit, if a little terse.
+
+plmp3 uses playlists to hold lists of songs. The playlist extension is .m3u
+and the playlist contents is a filename with the full path:
+
+mp3/Music/William Shatner/Has Been/01 Common People.mp3
+mp3/Music/Firefall/Firefall_-_Cinderella.mp3
+etc.
+
+The shuffle function is written in c since the python version took 30 minutes to 
+run with 5000 songs. The c version takes 3 seconds on the pi zero.
+
+
+'''
+
+
+
+import board
+import busio
+import adafruit_character_lcd
+import adafruit_mpr121
+import digitalio
+
+import time
+import os
+import sys
+from random import randint
+
+# libs for mp3 files
+import vlc
+
+# read ID3 tags
+import eyed3
+
+# set up i2c bus
+i2c = busio.I2C(board.SCL, board.SDA)
+
+# set up lcd
+cols = 16
+rows = 2
+lcd = adafruit_character_lcd.Character_LCD_I2C(i2c,cols,rows)
+lcd.set_backlight(False)  # turn ON backlight
+lcd.home()
+
+# create mpr121 class (touch buttons)
+mpr121 = adafruit_mpr121.MPR121(i2c)
+
+# define select knob switch
+SW = digitalio.DigitalInOut(board.D17)
+SW.direction = digitalio.Direction.INPUT
+SW.pull = digitalio.Pull.UP
+
+# define select knob
+KNOB = digitalio.DigitalInOut(board.D22)	# was 22
+KNOB.direction = digitalio.Direction.INPUT
+KNOB.pull = digitalio.Pull.UP
+
+DIR = digitalio.DigitalInOut(board.D27)		# was 27
+DIR.direction = digitalio.Direction.INPUT
+DIR.pull = digitalio.Pull.UP
+
+def getID(track):	# get ID3 tags, show on display
+	ID = eyed3.load(track)
+	if ID == None:
+		lcd.clear()
+		lcd.message('(empty)        \n(empty)        ')
+		return
+	if ID.tag == None:
+		print('id tags missing')
+		artist = '(empty)'
+		title = '(empty)'
+	else:
+		if ID.tag.artist == None:
+			artist = '(empty)'
+		else:
+			artist = ID.tag.artist
+			artist = str(artist[:16])
+		if ID.tag.title == None:
+			title = '(empty)'
+		else:
+			title = ID.tag.title
+			title = str(title[:16])
+	lcd.clear()
+	lcd.message(artist + '\n' + title)
+
+
+# initialize options
+# S=shuffle R = repeat
+# SR = 0, no shuffle, no repeat
+# SR = 1 Shuffle, no repeat
+# SR = 2 Repeat, no shuffle
+# SR = 3 Shuffle and Repeat
+SR = 0	
+SRmsg = ['--','S-','-R','SR']
+
+# Show startup message
+lcd.home()
+lcd.message('Loading Playlist')
+
+# randomize the playlist
+# randomize_list is a c program to shuffle the tracks
+CMD='./randomize_list ' + sys.argv[1]
+print(CMD)
+os.system(CMD)
+# new playlist is called ./rand.m3u
+
+
+
+# read song list into an array
+playlist = []
+plcount = 0
+with open('rand.m3u') as plist:
+	for l in plist:
+		if l[:1] == '#':	# ignore lines starting with #
+			#print('skipping ' + l)
+			continue
+		playlist.append(l.strip())	# remove newlines
+		plcount+=1
+plist.close()
+print('Songs: {}'.format(plcount))
+
+
+
+#def goto(linenum):
+#	global line
+#	line=linenum
+
+
+
+# set up VLC
+instance = vlc.Instance(' --aout=alsa')
+VOLUME = 85	# initial volume
+
+# set up audio equalizer
+'''
+eqz = vlc.libvlc_audio_equalizer_new()
+#eqz.libvlc_media_player_set_equalizer(p_mi,p_equalizer)
+#eqz.set_equalizer()
+bc = eqz.libvlc_audio_equalizer_get_band_count()
+print('band count {}'.format(int(bc)))
+#libvlc_audio_equalizer_set_amp_at_index(p_equalizer, f_amp, u_band)
+# amps are -20.0 thru +20.0
+'''
+
+
+PLAY = 1
+lcd.clear()
+lcd.message('MP3 Player      \nStarting')
+
+#line = 1	# goto here for repeat play
+
+#########################
+# THIS IS THE MAIN LOOP #
+#########################
+
+for song in playlist:
+	print('Playing ' + song)
+	p = vlc.MediaPlayer(song)
+
+	
+	#p.set_equalizer()
+
+	p.audio_set_volume(VOLUME)
+	PLAY = 1
+	p.play()
+	lcd.clear()
+	while p.is_playing() == False: 	# wait until the song starts
+		continue		# else it just steps thru all the songs
+
+	# show ID3 tags
+	getID(song)
+
+	# show shuffle and repeat
+
+###################
+#### PLAY LOOP ####
+###################
+
+	# test buttons and knob while playing
+	
+	while True:
+		if mpr121[3].value == True and mpr121[1].value == False:	# play
+			time.sleep(0.1)
+			if mpr121[3].value:
+				if PLAY == 0:	# currently stopped
+					p.play()
+					while p.is_playing() == False:	# CHANGED
+						continue
+					PLAY = 1
+					lcd.clear()
+					#lcd.message('Playing...         ')
+					while mpr121[3].value:		# wait until released
+						continue
+					#time.sleep(1.5)		# time to start playing
+					getID(song)			# show track info
+					continue
+				if PLAY == 1:	# currently playing
+					p.pause()
+					PLAY = 2
+					lcd.clear()
+					lcd.message('Paused...          ')
+					while mpr121[3].value:		# wait until released
+						continue
+					continue
+				if PLAY == 2:	# currently paused
+					p.pause()			# restart from paused position
+					PLAY = 1
+					lcd.clear()
+					lcd.message('Playing...         ')
+					while mpr121[3].value:		# wait until released
+						continue
+					getID(song)
+					continue
+	
+		# set SR (shuffle/repeat)
+		if mpr121[3].value == True and mpr121[1].value == True:
+			SR += 1
+			if SR > 3:
+				SR = 0
+			print('SR {}'.format(SR))
+			lcd.set_cursor(14,0)	# upper right
+			#lcd.message('{}'.format(SR))
+			lcd.message(SRmsg[SR])
+			while mpr121[3].value == True:
+				continue
+			getID(song)
+			continue
+
+		
+		# save current song to mostfav.m3u playlist
+		if mpr121[1].value and mpr121[2].value:
+			with open('playlists/mostfav.m3u','a') as mflist:
+				mflist.write('{0:}\n'.format(song))
+				mflist.close()
+			print('saved {0:} to mostfav.m3u'.format(song))
+			lcd.clear()
+			lcd.message('Save to most fav\nplaylist')
+			# wait until released
+			while mpr121[1].value and mpr121[2].value:
+				continue
+			getID(song)
+			continue
+ 
+
+		if mpr121[2].value and mpr121[1].value == False:	# stop
+			time.sleep(0.1)
+			if mpr121[2].value:
+				if (PLAY == 1 or PLAY == 2):	# playing or paused
+					p.stop()
+					PLAY = 0	# set stop
+					lcd.clear()
+					lcd.message('MP3 Player         \nStopped')
+					while mpr121[2].value:	# wait until released
+						continue
+					continue
+				if PLAY == 0:		# currently stopped
+					lcd.clear()
+					lcd.message('Exiting...')
+					while mpr121[2].value:	# wait until released
+						continue
+					time.sleep(1.0)		# time to show message
+					lcd.clear()
+					sys.exit(0)		# exit program
+
+	
+		if mpr121[5].value == True and mpr121[1].value == False:	# next track
+			time.sleep(0.1)
+			if mpr121[5].value:
+				if (PLAY == 1 or PLAY == 2):	# playing or paused
+					p.stop()
+					lcd.clear()
+					lcd.message('Next...         ')
+					while mpr121[5].value:		# wait until released
+						continue
+					time.sleep(0.2)
+					lcd.home()
+					break	# was continue
+
+		if mpr121[4].value == True and mpr121[1].value == False:	# rewind
+			time.sleep(0.1)
+			if mpr121[4].value:
+				lcd.clear()
+				lcd.message('Rewind...       ')
+				p.set_position(0.0)
+				while mpr121[4].value:		# wait until released
+					continue
+				time.sleep(0.2)
+				getID(song)
+				continue
+
+
+		# skip backward
+		if mpr121[1].value == True and mpr121[4].value == True: 
+			while mpr121[1].value == True and mpr121[4].value == True:
+				cpos = p.get_position()
+				if cpos > 0.01:
+					p.set_position(cpos - 0.015)	# 1.5%
+					lcd.set_cursor(0,1)
+					lcd.message('index:{0:.0f}%          '.format(float(100*p.get_position())))
+				#time.sleep(0.5)
+			getID(song)
+			continue
+
+		# skip forward
+		if mpr121[1].value == True and mpr121[5].value == True:
+			while mpr121[1].value == True and mpr121[5].value == True:
+				cpos = p.get_position()
+				if cpos < 0.99:
+					p.set_position(cpos + 0.015)	# 1.5%
+					lcd.set_cursor(0,1)
+					lcd.message('index:{0:.0f}%         '.format(float(100*p.get_position())))
+				#time.sleep(0.5)
+			getID(song)
+			continue
+
+	
+	
+		if PLAY == 1:
+			if p.is_playing() == False:
+				break		# allow next song in playlist to start	
+
+
+		# Volume Control using the knob
+		state = KNOB.value
+		time.sleep(0.01)
+		if KNOB.value == state:
+			continue
+	
+
+		if (KNOB.value == False and p.is_playing() == True):
+			if (DIR.value == True and KNOB.value == False):
+				VOLUME+=5 
+				if VOLUME >= 100:
+					VOLUME = 100
+				p.audio_set_volume(VOLUME)
+				print('vol UP ' + str(VOLUME))
+				continue
+
+			if (DIR.value == False and KNOB.value == False):
+				VOLUME-=5
+				if VOLUME <=0:
+					VOLUME = 0
+				p.audio_set_volume(VOLUME)
+				print('vol down ' + str(VOLUME))
+				continue
+
+
+			continue
+
+	# song finished playing
+	continue
+
+# last song finished playing
+lcd.home()
+lcd.message('Finished')
+
+
